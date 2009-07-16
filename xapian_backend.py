@@ -1,6 +1,7 @@
 import datetime
 import cPickle as pickle
 import os
+from os.path import join
 import re
 import warnings
 
@@ -8,7 +9,7 @@ from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.utils.encoding import smart_unicode, force_unicode
 
-from haystack.backends import BaseSearchBackend, BaseSearchQuery
+from haystack.backends import BaseSearchBackend, BaseSearchQuery, IDENTIFIER_REGEX
 from haystack.exceptions import MissingDependency
 from haystack.models import SearchResult
 
@@ -82,6 +83,60 @@ class SearchBackend(BaseSearchBackend):
         if not os.path.exists(self.path):
             os.makedirs(self.path)
 
+    def get_identifier(self, obj_or_string):
+        """
+        Uses compressed model for identifying than the base
+        @arguments:
+        obj_or_string: Object
+        @returns:
+        unique identifier
+        """
+        if isinstance(obj_or_string, basestring):
+            if not IDENTIFIER_REGEX.match(obj_or_string):
+                raise AttributeError("Provided string '%s' is not a valid identifier." % obj_or_string)
+            
+            return obj_or_string
+        
+        return u"%s" % (obj_or_string._get_pk_val())
+    
+    def get_prefix(self, obj):
+        """
+        Find object app and model class
+        """
+        return "%s.%s" % (obj._meta.app_label, obj._meta.module_name)
+
+    def initiate_index(self, prefix, schema=None, readonly=False):
+        db_path = join(self.path, prefix )
+        exists_flag = True
+        if not os.path.exists(db_path):
+            exists_flag = False
+            os.makedirs(db_path)
+
+        if readonly == False:
+            database = xapian.WritableDatabase(db_path, xapian.DB_CREATE_OR_OPEN)
+            if exists_flag == False:
+                database.set_metadata('schema', pickle.dumps(schema))
+                database.set_metadata('model', prefix)
+            else:
+                # verify if index is ours
+                model = database.get_metadata('model')
+                if prefix != model:
+                    warnings.warn("Database not created via haystack backend", Warning, stacklevel=2)
+            indexer = xapian.TermGenerator()
+            indexer.set_database(database)
+            indexer.set_stemmer(self.stemmer)
+            indexer.set_flags(xapian.TermGenerator.FLAG_SPELLING)
+            return  database, indexer
+        else: 
+            database = xapian.Database(db_path)
+            model = database.get_metadata('model')
+            if prefix != model:
+                warnings.warn("Database not created via haystack backend", Warning, stacklevel=2)
+            return database, None
+
+
+
+
     def update(self, index, iterable):
         """
         Updates the `index` with any objects in `iterable` by adding/updating
@@ -131,23 +186,22 @@ class SearchBackend(BaseSearchBackend):
         through the use of the :method:xapian.sortable_serialise method.
         """
         schema = self._build_schema()
-
-        database = xapian.WritableDatabase(self.path, xapian.DB_CREATE_OR_OPEN)
-        database.set_metadata('schema', pickle.dumps(schema))
-
-        indexer = xapian.TermGenerator()
-        indexer.set_database(database)
-        indexer.set_stemmer(self.stemmer)
-        indexer.set_flags(xapian.TermGenerator.FLAG_SPELLING)
-
+  
+        databases = {}
+        
         try:
             for obj in iterable:
                 document_id = self.get_identifier(obj)
+                database_id = self.get_prefix(obj)
+                if databases.has_key(database_id) == False:
+                    databases[database_id] = self.initiate_index(
+                        database_id, schema)
+                database, indexer = databases[database_id]
                 document = xapian.Document()
                 indexer.set_document(document)
                 document.add_value(0, force_unicode(document_id))
                 document_data = index.prepare(obj)
-
+                #print document_data
                 for i, (key, value) in enumerate(document_data.iteritems()):
                     if key in schema:
                         prefix = DOCUMENT_CUSTOM_TERM_PREFIX + self._from_python(key).upper()
@@ -162,11 +216,7 @@ class SearchBackend(BaseSearchBackend):
 
                 document.set_data(pickle.dumps(document_data, pickle.HIGHEST_PROTOCOL))
                 document.add_term(DOCUMENT_ID_TERM_PREFIX + document_id)
-                document.add_term(
-                    DOCUMENT_CT_TERM_PREFIX + u'%s.%s' % 
-                    (obj._meta.app_label, obj._meta.module_name)
-                )
-
+                
                 database.replace_document(DOCUMENT_ID_TERM_PREFIX + document_id, document)
 
         except UnicodeDecodeError:
@@ -180,6 +230,8 @@ class SearchBackend(BaseSearchBackend):
         We delete all instances of `Q<app_name>.<model_name>.<pk>` which
         should be unique to this object.
         """
+        database_id = self.prefix(obj)
+        database, index = self.initiat_index(prefix)
         database = xapian.WritableDatabase(self.path, xapian.DB_CREATE_OR_OPEN)
         database.delete_document(DOCUMENT_ID_TERM_PREFIX + self.get_identifier(obj))
 
@@ -198,19 +250,21 @@ class SearchBackend(BaseSearchBackend):
         the term `XCONTENTTYPE<app_name>.<model_name>`.  This will delete
         all documents with the specified model type.
         """
-        database = xapian.WritableDatabase(self.path, xapian.DB_CREATE_OR_OPEN)
         if not models:
-            query = xapian.Query('') # Empty query matches all
-            enquire = xapian.Enquire(database)
-            enquire.set_query(query)
-            for match in enquire.get_mset(0, DEFAULT_MAX_RESULTS):
-                database.delete_document(match.get_docid())
-        else:
-            for model in models:
-                database.delete_document(
-                    DOCUMENT_CT_TERM_PREFIX + '%s.%s' % 
-                    (model._meta.app_label, model._meta.module_name)
-                )
+            return 
+        for model in models:
+            database_id = self.get_prefix(model)
+            
+            db_path = join(self.path, database_id)
+            # remove the directory instead of cleaning up and making index 
+            # empty
+            if os.path.exists(db_path):
+                index_files = os.listdir(db_path)
+            for index_file in index_files:
+                os.remove(os.path.join(db_path, index_file))    
+            os.removedirs(db_path)
+
+
 
     def search(self, query_string, sort_by=None, start_offset=0, end_offset=DEFAULT_MAX_RESULTS,
                fields='', highlight=False, facets=None, date_facets=None, query_facets=None,
@@ -274,8 +328,33 @@ class SearchBackend(BaseSearchBackend):
         if highlight is not False:
             warnings.warn("Highlight has not been implemented yet.", Warning, stacklevel=2)
 
-        database = xapian.Database(self.path)
-        schema = pickle.loads(database.get_metadata('schema'))
+        
+
+
+        database = xapian.Database()
+        dbgroup = []
+        counter = 0
+        schemagroup = {}
+        for item in os.listdir(self.path):
+            db_path = join(self.path, item)
+            if os.path.isdir(db_path):
+                try:
+                    db = xapian.Database(db_path)
+                    app , model = db.get_metadata('model').split('.')
+                    doccount = db.get_doccount()
+                    dbgroup.append((counter, doccount, app, model))
+                    counter = doccount + 1
+                    database.add_database(db)
+                except Exception, e:
+                    print str(e)
+                    warnings.warn("Search Database at %s corrupted " % db_path, Warning, stacklevel=2)
+                try:
+                    sm = pickle.loads(db.get_metadata('schema'))
+                    schemagroup.update(sm)
+                except Exception, e:
+                    warnings.warn("Search Database at %s not created using haystack " % db_path, Warning, stacklevel=2)
+                
+        schema = schemagroup
         spelling_suggestion = None
 
         if query_string == '*':
@@ -306,7 +385,7 @@ class SearchBackend(BaseSearchBackend):
         enquire = xapian.Enquire(database)
         enquire.set_query(query)
         enquire.set_docid_order(enquire.ASCENDING)
-
+        print query
         if sort_by:
             sorter = xapian.MultiValueSorter()
             for sort_field in sort_by:
@@ -319,7 +398,7 @@ class SearchBackend(BaseSearchBackend):
             enquire.set_sort_by_key_then_relevance(sorter, True)
 
         matches = enquire.get_mset(start_offset, end_offset)
-        results = self._process_results(matches, facets)
+        results = self._process_results(matches, dbgroup, facets)
 
         if spelling_suggestion:
             results['spelling_suggestion'] = spelling_suggestion
@@ -374,7 +453,13 @@ class SearchBackend(BaseSearchBackend):
 
         Finally, processes the resulting matches and returns.
         """
-        database = xapian.Database(self.path)
+        prefix = self.get_prefix(model_instance)
+        db_path = join(self.path, prefix)
+        database = xapian.Database(db_path)
+        dbgroup = []
+        dcount = database.get_doccount()
+        app_label, model = prefix.split('.')
+        dbgroup.append((0, dcount, app_label, model))
         query = xapian.Query(
             DOCUMENT_ID_TERM_PREFIX + self.get_identifier(model_instance)
         )
@@ -392,9 +477,9 @@ class SearchBackend(BaseSearchBackend):
         )
         enquire.set_query(query)
         matches = enquire.get_mset(0, DEFAULT_MAX_RESULTS)
-        return self._process_results(matches)
+        return self._process_results(matches, dbgroup)
 
-    def _process_results(self, matches, facets=None):
+    def _process_results(self, matches, dbgroup, facets=None):
         """
         Private method for processing an MSet (match set).
 
@@ -432,7 +517,15 @@ class SearchBackend(BaseSearchBackend):
 
         for match in matches:
             document = match.get_document()
-            app_label, module_name, pk = document.get_value(0).split('.')
+            pk = document.get_value(0)
+            docid = match.get_docid()
+            app_label = None
+            module_name = None
+            for min, max, app, model in dbgroup:
+                if docid >= min and docid <= max:
+                    app_label = app
+                    module_name = model
+                    continue
             additional_fields = pickle.loads(document.get_data())
             result = SearchResult(
                 app_label, module_name, pk, match.weight, **additional_fields
@@ -480,16 +573,18 @@ class SearchBackend(BaseSearchBackend):
         Converts Python values to a string for Xapian.
 
         Original code courtesy of pysolr.
+        Modified to morphological order
+
         """
         if isinstance(value, datetime.datetime):
-            value = force_unicode('%s' % value.isoformat())
+            value = force_unicode(value.strftime('%Y%m%d%H%M%S'))
         elif isinstance(value, datetime.date):
-            value = force_unicode('%sT00:00:00' % value.isoformat())
+            value = force_unicode(value.strftime('%Y%m%d'))
         elif isinstance(value, bool):
             if value:
-                value = u'true'
+                value = u't'
             else:
-                value = u'false'
+                value = u'f'
         else:
             value = force_unicode(value)
         return value
